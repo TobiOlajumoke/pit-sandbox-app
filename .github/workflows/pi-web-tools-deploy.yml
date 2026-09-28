@@ -1,0 +1,197 @@
+# Push-button deploy of an already-built, already-published WAR to one PIT
+# environment, executed on the host through the PIT-DeployWebTools SSM document.
+#
+#   verify   - download + checksum on the host, changes nothing (safe dry run)
+#   deploy   - backup -> stop -> swap -> start -> health check (auto-rollback)
+#   rollback - restore the most recent on-host backup
+#   restart  - stop -> start -> health check
+#
+# Per-environment settings live in GitHub Environments (dev / qa / prod), not here.
+# prod is protected by required reviewers and a master-only branch policy.
+name: pi-web-tools deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        options: [dev, qa, prod]
+      action:
+        description: What to do
+        type: choice
+        required: true
+        default: verify
+        options: [verify, deploy, rollback, restart]
+      version:
+        description: Build version (e.g. gha42-1a2b3c4). Required for verify/deploy.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pit-deploy-${{ inputs.environment }}
+  cancel-in-progress: false # never interrupt a deploy halfway
+
+jobs:
+  deploy:
+    name: ${{ inputs.action }} → ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # OIDC -> gha-pit-deploy-<env>; trust is bound to this Environment
+    env:
+      TARGET_ENV: ${{ inputs.environment }}
+      ACTION: ${{ inputs.action }}
+      VERSION: ${{ inputs.version }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      ANT_BUILD_TARGET: ${{ vars.ANT_BUILD_TARGET }}
+      PIT_INSTANCE_ID: ${{ vars.PIT_INSTANCE_ID }}
+      SSM_DOCUMENT_NAME: ${{ vars.SSM_DOCUMENT_NAME }}
+      TOMCAT_HOME: ${{ vars.TOMCAT_HOME }}
+      TOMCAT_USER: ${{ vars.TOMCAT_USER }}
+      TOMCAT_SERVICE: ${{ vars.TOMCAT_SERVICE }}
+      WEBAPP_NAME: ADS_web_tools
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+      WEBHOOK_URL: ${{ secrets.PIT_DEPLOY_WEBHOOK_URL }}
+    steps:
+      - name: Validate request and environment config
+        run: |
+          set -euo pipefail
+          for v in AWS_REGION ARTIFACT_BUCKET ANT_BUILD_TARGET PIT_INSTANCE_ID SSM_DOCUMENT_NAME TOMCAT_HOME; do
+            [[ -n "${!v:-}" ]] || { echo "::error::'${v}' is not set in GitHub Environment '${TARGET_ENV}'"; exit 1; }
+          done
+          [[ "$PIT_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]] || { echo "::error::PIT_INSTANCE_ID is not an instance id"; exit 1; }
+          if [[ "$ACTION" == "deploy" || "$ACTION" == "verify" ]]; then
+            [[ "$VERSION" =~ ^gha[0-9]+-[0-9a-f]{7}$ ]] || { echo "::error::version must look like gha<run>-<sha7>, got '${VERSION}'"; exit 1; }
+          fi
+          if [[ "$TARGET_ENV" == "prod" && "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::prod can only be operated from a run on master"; exit 1
+          fi
+          echo "Request: ${ACTION} ${VERSION:-(no version)} -> ${TARGET_ENV} (${PIT_INSTANCE_ID}) by ${GITHUB_ACTOR}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-pit-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check the host is reachable through SSM
+        run: |
+          set -euo pipefail
+          ping="$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${PIT_INSTANCE_ID}" \
+            --query 'InstanceInformationList[0].PingStatus' --output text)"
+          if [[ "$ping" != "Online" ]]; then
+            echo "::error::${PIT_INSTANCE_ID} SSM agent status is '${ping}' (expected Online). Fix the agent before deploying."
+            exit 1
+          fi
+          echo "SSM agent Online"
+
+      - name: Notify start
+        if: env.WEBHOOK_URL != '' && inputs.action != 'verify'
+        run: |
+          set -euo pipefail
+          text="PIT ${TARGET_ENV}: ${ACTION} ${VERSION:-} started by ${GITHUB_ACTOR} - app restart in progress. ${RUN_URL}"
+          jq -n --arg text "$text" '{text:$text}' | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK_URL" >/dev/null || echo "::warning::notification failed"
+
+      - name: Run on host via SSM
+        id: ssm
+        run: |
+          set -euo pipefail
+          url="none"; sha="none"; ver="none"
+
+          if [[ "$ACTION" == "deploy" || "$ACTION" == "verify" ]]; then
+            prefix="pi-web-tools/${ANT_BUILD_TARGET}/${VERSION}"
+            aws s3 cp "s3://${ARTIFACT_BUCKET}/${prefix}/build-info.json" build-info.json --only-show-errors \
+              || { echo "::error::build ${VERSION} (${ANT_BUILD_TARGET}) not found in s3://${ARTIFACT_BUCKET}/${prefix}/"; exit 1; }
+            sha="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/${prefix}/${WEBAPP_NAME}.war.sha256" - | awk '{print $1}')"
+            [[ "$sha" =~ ^[a-f0-9]{64}$ ]] || { echo "::error::missing/invalid checksum for ${VERSION}"; exit 1; }
+            built_ref="$(jq -r .ref build-info.json)"
+            if [[ "$TARGET_ENV" == "prod" && "$built_ref" != "refs/heads/master" ]]; then
+              echo "::error::prod only accepts builds from master; ${VERSION} was built from ${built_ref}"; exit 1
+            fi
+            echo "Build: $(jq -c . build-info.json)"
+            # 15-minute presigned URL: the host downloads with no S3 permissions of its own.
+            url="$(aws s3 presign "s3://${ARTIFACT_BUCKET}/${prefix}/${WEBAPP_NAME}.war" --expires-in 900)"
+            echo "::add-mask::${url}"
+            ver="$VERSION"
+          fi
+
+          params="$(jq -n \
+            --arg mode "$ACTION" --arg url "$url" --arg sha "$sha" --arg ver "$ver" \
+            --arg th "$TOMCAT_HOME" --arg tu "${TOMCAT_USER:-root}" --arg ts "${TOMCAT_SERVICE:-none}" \
+            --arg app "$WEBAPP_NAME" --arg run "$RUN_URL" \
+            '{Mode:[$mode],ArtifactUrl:[$url],ArtifactSha256:[$sha],Version:[$ver],TomcatHome:[$th],TomcatUser:[$tu],TomcatServiceName:[$ts],WebappName:[$app],RunReference:[$run]}')"
+
+          # shellcheck disable=SC2016  # '$DEFAULT' is a literal SSM document version, not a shell var
+          cmd_id="$(aws ssm send-command \
+            --instance-ids "$PIT_INSTANCE_ID" \
+            --document-name "$SSM_DOCUMENT_NAME" \
+            --document-version '$DEFAULT' \
+            --parameters "$params" \
+            --comment "pi-web-tools ${ACTION} ${ver} (${TARGET_ENV})" \
+            --timeout-seconds 600 \
+            --query 'Command.CommandId' --output text)"
+          echo "command_id=${cmd_id}" >> "$GITHUB_OUTPUT"
+          echo "SSM command ${cmd_id} sent"
+
+          deadline=$((SECONDS + 1800))
+          status="Pending"
+          while (( SECONDS < deadline )); do
+            status="$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$PIT_INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)"
+            case "$status" in Success|Failed|Cancelled|TimedOut) break ;; esac
+            sleep 10
+          done
+
+          inv="$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$PIT_INSTANCE_ID" --output json)"
+          rc="$(jq -r '.ResponseCode' <<<"$inv")"
+          echo "----- host output -----"
+          jq -r '.StandardOutputContent' <<<"$inv"
+          jq -r '.StandardErrorContent | select(length > 0)' <<<"$inv" | sed 's/^/[stderr] /'
+          echo "-----------------------"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+
+          case "$status/$rc" in
+            Success/0) echo "${ACTION} succeeded on ${TARGET_ENV}" ;;
+            */2) echo "::error::Deploy FAILED its health check - the previous version was restored and is healthy."; exit 1 ;;
+            */3) echo "::error::CRITICAL: live change failed and could not be rolled back automatically. Check the host now."; exit 1 ;;
+            *)   echo "::error::SSM status ${status}, exit code ${rc}"; exit 1 ;;
+          esac
+
+      - name: Summary
+        if: always()
+        env:
+          STATUS: ${{ steps.ssm.outputs.status }}
+          RC: ${{ steps.ssm.outputs.rc }}
+          CMD: ${{ steps.ssm.outputs.command_id }}
+        run: |
+          {
+            echo "### PIT ${TARGET_ENV}: ${ACTION} ${VERSION}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Instance | \`${PIT_INSTANCE_ID}\` |"
+            echo "| Build target | \`${ANT_BUILD_TARGET}\` |"
+            echo "| SSM command | \`${CMD:-not sent}\` |"
+            echo "| Result | ${STATUS:-not run} (exit ${RC:-n/a}) |"
+            echo "| Triggered by | @${GITHUB_ACTOR} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify result
+        if: always() && env.WEBHOOK_URL != '' && inputs.action != 'verify'
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          text="PIT ${TARGET_ENV}: ${ACTION} ${VERSION:-} finished - ${JOB_STATUS}. ${RUN_URL}"
+          jq -n --arg text "$text" '{text:$text}' | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK_URL" >/dev/null || echo "::warning::notification failed"

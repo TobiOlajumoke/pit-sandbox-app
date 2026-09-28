@@ -1,0 +1,71 @@
+<?xml version="1.0" ?>
+<!--
+  Sandbox stand-in for pi-web-tools' build.xml. Same shape on purpose, so the
+  real workflows run unchanged:
+    - sources in WEB-INF/src, vendored jars in WEB-INF/lib
+    - javac release="8" (needs JDK 9+, emits Java 8 bytecode)
+    - target war-tc7 -> dist/ADS_web_tools-tc7-${version}.war
+  Contains no IDEXX code.
+-->
+<project name="ADS_web_tools" default="war">
+
+  <property name="version" value="1"/>
+  <property name="src" value="WEB-INF/src"/>
+  <property name="lib" value="WEB-INF/lib"/>
+  <property name="build" value="build/classes"/>
+  <property name="stamp.dir" value="build/stamp"/>
+
+  <path id="build.classpath">
+    <fileset dir="${lib}" includes="**/*.jar"/>
+  </path>
+
+  <target name="init" description="Clean dist and build for a clean build">
+    <delete dir="build"/>
+    <delete dir="dist"/>
+    <mkdir dir="${build}"/>
+    <mkdir dir="${stamp.dir}"/>
+    <mkdir dir="dist"/>
+  </target>
+
+  <target name="compile" depends="init" description="Compile to Java 8 bytecode">
+    <javac release="8" encoding="UTF-8" destdir="${build}" srcdir="${src}"
+           classpathref="build.classpath" includeantruntime="false"
+           debug="on" debuglevel="lines,vars,source"/>
+  </target>
+
+  <!-- Writes BUILD_INFO into the WAR so the page shows which build is live. -->
+  <target name="stamp">
+    <tstamp><format property="build.time" pattern="yyyy-MM-dd'T'HH:mm:ss'Z'" timezone="UTC"/></tstamp>
+    <exec executable="git" outputproperty="git.sha.raw" failifexecutionfails="false" errorproperty="git.err">
+      <arg line="rev-parse --short HEAD"/>
+    </exec>
+    <condition property="git.sha" value="${git.sha.raw}" else="unknown">
+      <and>
+        <isset property="git.sha.raw"/>
+        <length string="${git.sha.raw}" trim="true" when="greater" length="0"/>
+      </and>
+    </condition>
+    <echo file="${stamp.dir}/BUILD_INFO">version=${version} commit=${git.sha} built=${build.time}</echo>
+  </target>
+
+  <target name="war-tc7" depends="compile,stamp" description="Tomcat 7 WAR">
+    <war destfile="dist/ADS_web_tools-tc7-${version}.war" webxml="WEB-INF/web.xml">
+      <fileset dir=".">
+        <exclude name="**/*.java"/>
+        <exclude name="**/dist/**"/>
+        <exclude name="**/build/**"/>
+        <exclude name="**/.*/**"/>
+        <exclude name="**/.*"/>
+        <exclude name="**/*.md"/>
+        <exclude name="build.xml"/>
+        <exclude name="**/servlet-api.jar"/>
+        <exclude name="**/jsp-api.jar"/>
+      </fileset>
+      <fileset dir="${stamp.dir}"/>
+      <classes dir="${build}"/>
+    </war>
+  </target>
+
+  <target name="war" depends="war-tc7" description="Default WAR build for Tomcat 7"/>
+
+</project>

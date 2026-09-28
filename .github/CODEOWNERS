@@ -1,0 +1,4 @@
+# Changes to pipelines or build config need review from the pipeline owner.
+# setup-github.sh replaces @YOUR_GITHUB_USERNAME with your login.
+/.github/   @YOUR_GITHUB_USERNAME
+/build.xml  @YOUR_GITHUB_USERNAME
