@@ -14,8 +14,10 @@ on:
 permissions:
   contents: read
 
+# PRs share one group per PR, so a new push cancels the superseded run. Master pushes and
+# manual runs get a group per run: nothing is queued and dropped, every merge is deployable.
 concurrency:
-  group: pi-web-tools-build-${{ github.ref }}
+  group: pi-web-tools-build-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -158,13 +160,22 @@ jobs:
           set -euo pipefail
           version="$(jq -r .version out/build-info.json)"
           prefix="pi-web-tools/${TARGET}/${version}"
+          marker="${prefix}/${WEBAPP_NAME}.war.sha256"   # uploaded last; its presence means "published"
           local_sha="$(awk '{print $1}' "out/${WEBAPP_NAME}.war.sha256")"
 
-          # Idempotent: a re-run of the same build is a no-op; a *different* WAR
-          # under an existing version is refused (builds are immutable).
-          if remote_sha="$(aws s3 cp "s3://${BUCKET}/${prefix}/${WEBAPP_NAME}.war.sha256" - 2>/dev/null | awk '{print $1}')" && [[ -n "$remote_sha" ]]; then
+          # Existence check via ListObjectsV2: 0 = not published, 1 = published. Any S3 error
+          # (403, throttling, network) fails the step under set -e instead of meaning "not published".
+          count="$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$marker" --query 'KeyCount' --output text)"
+          if [[ "$count" != "0" ]]; then
+            remote_sha="$(aws s3 cp "s3://${BUCKET}/${marker}" - | awk '{print $1}')"
             if [[ "$remote_sha" == "$local_sha" ]]; then
               echo "Version ${version} already published with identical checksum - nothing to do."
+              exit 0
+            fi
+            # The version is run number + commit, so a mismatch can only come from "Re-run all jobs"
+            # rebuilding the WAR (Ant writes new zip timestamps). Keep the original: versions are immutable.
+            if (( GITHUB_RUN_ATTEMPT > 1 )); then
+              echo "::notice::${version} was published by an earlier attempt of this run; keeping that build (sha256 ${remote_sha})."
               exit 0
             fi
             echo "::error::${prefix} already exists with a different checksum - refusing to overwrite"
