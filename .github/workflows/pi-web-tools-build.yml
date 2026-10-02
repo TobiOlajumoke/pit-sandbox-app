@@ -165,8 +165,11 @@ jobs:
 
           # Existence check via ListObjectsV2: 0 = not published, 1 = published. Any S3 error
           # (403, throttling, network) fails the step under set -e instead of meaning "not published".
-          count="$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$marker" --query 'KeyCount' --output text)"
-          if [[ "$count" != "0" ]]; then
+          # Count Contents rather than KeyCount: the CLI's auto-pagination drops KeyCount (prints "None").
+          # shellcheck disable=SC2016  # backticks are a JMESPath literal, not shell
+          count="$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$marker" --max-items 1 --query 'length(Contents || `[]`)' --output text)"
+          [[ "$count" =~ ^[0-9]+$ ]] || { echo "::error::Unexpected list-objects-v2 result: '${count}'"; exit 1; }
+          if (( count > 0 )); then
             remote_sha="$(aws s3 cp "s3://${BUCKET}/${marker}" - | awk '{print $1}')"
             if [[ "$remote_sha" == "$local_sha" ]]; then
               echo "Version ${version} already published with identical checksum - nothing to do."
